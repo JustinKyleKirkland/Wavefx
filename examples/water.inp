@@ -1,0 +1,14 @@
+# Water molecule HF/STO-3G calculation
+title = Water molecule optimization
+basis = STO-3G
+method = HF
+charge = 0
+multiplicity = 1
+max_iterations = 100
+convergence = 1e-8
+
+geometry
+O     0.0000     0.0000     0.0000
+H     0.7574     0.5860     0.0000
+H    -0.7574     0.5860     0.0000
+end

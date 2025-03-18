@@ -1,0 +1,82 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.env
+.venv
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Distribution
+*.tar.gz
+*.whl
+
+# Logs and databases
+*.log
+logs/
+*.sqlite
+*.db
+
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# Project-specific
+# Quantum chemistry calculation outputs and temporary files
+*.chk
+*.fchk
+*.molden
+*.cube
+*.wfn
+*.wfx
+*.out
+temp/
+scratch/
+results/
+
+# Documentation builds
+docs/_build/
+docs/api/
+
+# Local configuration
+.env.local
+.env.*.local
+config.local.yaml
