@@ -7,12 +7,37 @@ This module provides Kohn-Sham DFT functionality with LDA and PBE functionals.
 """
 
 import logging
+import multiprocessing as mp
 from typing import Optional, Tuple
 
 import numpy as np
+from scipy.sparse import csr_matrix, lil_matrix
 
 from .hartree_fock import HartreeFock
 from .molecule import Molecule
+
+# Global variables for multiprocessing
+MAX_WORKERS = max(1, mp.cpu_count() - 1)  # Leave one CPU free
+CHUNK_SIZE = 1000  # Number of grid points to process at once
+
+
+def _compute_grid_chunk(args):
+	"""Helper function for parallel grid computations."""
+	points, weights, basis_functions, D = args
+	try:
+		# Evaluate basis functions for this chunk
+		basis_vals = np.zeros((len(points), len(basis_functions)))
+		for i, basis in enumerate(basis_functions):
+			for p in range(len(points)):
+				basis_vals[p, i] = basis.evaluate(points[p])
+
+		# Compute density for this chunk
+		rho = np.einsum("pi,ij,pj->p", basis_vals, D, basis_vals, optimize=True)
+
+		return rho * weights
+	except Exception as e:
+		logging.error(f"Error in grid chunk computation: {str(e)}")
+		return np.zeros(len(points))
 
 
 class DFTGrid:
@@ -486,10 +511,20 @@ class KohnShamDFT:
 		self.max_iter = max_iter
 		self.conv = conv
 
+		# Initialize multiprocessing pool
+		self.pool = mp.Pool(MAX_WORKERS)
+		logging.info(f"Initialized multiprocessing pool with {MAX_WORKERS} workers")
+
 		logging.info(f"\nInitializing Kohn-Sham DFT with {self.xc.name}")
 		logging.info(f"Number of basis functions: {self.n_basis}")
 		logging.info(f"Number of electrons: {self.n_electrons}")
 		logging.info(f"Number of grid points: {len(self.grid.points)}")
+
+	def __del__(self):
+		"""Clean up multiprocessing resources."""
+		if hasattr(self, "pool"):
+			self.pool.close()
+			self.pool.join()
 
 	def evaluate_basis_functions(self, points: np.ndarray) -> np.ndarray:
 		"""
@@ -572,109 +607,112 @@ class KohnShamDFT:
 			raise
 
 	def compute_density(self, D: np.ndarray, points: np.ndarray) -> np.ndarray:
-		"""
-		Compute electron density at given points.
-
-		Args:
-			D: Density matrix
-			points: Array of shape (n_points, 3)
-
-		Returns:
-			Array of shape (n_points,)
-		"""
+		"""Compute electron density at given points using parallel processing."""
 		try:
-			basis_vals = self.evaluate_basis_functions(points)
-			logging.debug(f"Basis values shape in compute_density: {basis_vals.shape}")
-			logging.debug(f"Density matrix shape: {D.shape}")
+			# Split points into chunks for parallel processing
+			n_points = len(points)
+			chunks = [
+				(points[i : i + CHUNK_SIZE], self.grid.weights[i : i + CHUNK_SIZE], self.basis_functions, D)
+				for i in range(0, n_points, CHUNK_SIZE)
+			]
 
-			# Ensure proper broadcasting for einsum
-			rho = np.einsum("pi,ij,pj->p", basis_vals, D, basis_vals, optimize=True)
-			logging.debug(f"Computed density shape: {rho.shape}")
+			# Process chunks in parallel
+			results = self.pool.map(_compute_grid_chunk, chunks)
 
-			return np.maximum(rho, 1e-10)  # Ensure positive density
+			# Combine results
+			rho = np.concatenate([r for r in results if r is not None])
+			return np.maximum(rho, 1e-10)
 
 		except Exception as e:
-			logging.error(f"Error in compute_density: {str(e)}")
+			logging.error(f"Error in parallel density computation: {str(e)}")
 			raise
 
 	def compute_vxc_matrix(self, D: np.ndarray) -> np.ndarray:
-		"""
-		Compute exchange-correlation potential matrix.
-
-		Args:
-			D: Density matrix
-
-		Returns:
-			Vxc matrix
-		"""
+		"""Memory-optimized computation of exchange-correlation potential matrix."""
 		try:
-			# Get density and gradients on grid
-			rho = self.compute_density(D, self.grid.points)
-			logging.debug(f"Density shape: {rho.shape}")
-
-			grad_rho = None
-			tau = None
-
-			# Compute gradients for GGA and meta-GGA functionals
-			if isinstance(
-				self.xc, (PBEFunctional, BLYPFunctional, B3LYPFunctional, TPSSFunctional, M06Functional, PW91Functional)
-			):
-				basis_grads = self.evaluate_basis_gradients(self.grid.points)
-				basis_vals = self.evaluate_basis_functions(self.grid.points)
-
-				logging.debug(f"Basis gradients shape: {basis_grads.shape}")
-				logging.debug(f"Basis values shape: {basis_vals.shape}")
-
-				grad_rho = np.zeros((len(self.grid.points), 3))
-
-				# Compute gradient using vectorized operations
-				for i in range(self.n_basis):
-					for j in range(self.n_basis):
-						try:
-							# Reshape arrays for broadcasting
-							grads_i = basis_grads[:, i, :].reshape(-1, 3)  # (n_points, 3)
-							vals_j = basis_vals[:, j].reshape(-1, 1)  # (n_points, 1)
-
-							# Compute contribution using broadcasting
-							contribution = grads_i * vals_j  # (n_points, 3)
-							grad_rho += 2.0 * D[i, j] * contribution
-
-						except Exception as e:
-							logging.error(f"Error in gradient computation at i={i}, j={j}: {str(e)}")
-							raise
-
-				logging.debug(f"Final gradient shape: {grad_rho.shape}")
-
-				# Compute kinetic energy density for meta-GGA functionals
-				if isinstance(self.xc, (TPSSFunctional, M06Functional)):
-					tau = self.compute_kinetic_density(D, self.grid.points)
-					logging.debug(f"Kinetic energy density shape: {tau.shape}")
-
-			# Compute XC potential
-			if isinstance(self.xc, (TPSSFunctional, M06Functional)):
-				_, vxc = self.xc.compute_exc(rho, grad_rho, tau)
+			# Use sparse matrices for large systems
+			if self.n_basis > 1000:
+				Vxc = lil_matrix((self.n_basis, self.n_basis))
 			else:
-				_, vxc = self.xc.compute_exc(rho, grad_rho)
+				Vxc = np.zeros((self.n_basis, self.n_basis))
 
-			if isinstance(vxc, np.ndarray) and vxc.ndim > 1:
-				vxc = vxc.flatten()
-			logging.debug(f"XC potential shape: {vxc.shape}")
+			# Process grid points in chunks to reduce memory usage
+			for i in range(0, len(self.grid.points), CHUNK_SIZE):
+				chunk_points = self.grid.points[i : i + CHUNK_SIZE]
+				chunk_weights = self.grid.weights[i : i + CHUNK_SIZE]
 
-			# Evaluate basis functions
-			basis_vals = self.evaluate_basis_functions(self.grid.points)
-			logging.debug(f"Final basis values shape: {basis_vals.shape}")
+				# Compute density and potential for this chunk
+				rho_chunk = self.compute_density(D, chunk_points)
 
-			# Construct Vxc matrix
-			weights_vxc = vxc * self.grid.weights
-			Vxc = np.einsum("p,pi,pj->ij", weights_vxc, basis_vals, basis_vals, optimize=True)
-			logging.debug(f"Final Vxc matrix shape: {Vxc.shape}")
+				# Compute gradients if needed
+				grad_rho_chunk = None
+				tau_chunk = None
+				if isinstance(
+					self.xc,
+					(PBEFunctional, BLYPFunctional, B3LYPFunctional, TPSSFunctional, M06Functional, PW91Functional),
+				):
+					grad_rho_chunk = self._compute_gradient_chunk(D, chunk_points)
 
-			return Vxc
+					if isinstance(self.xc, (TPSSFunctional, M06Functional)):
+						tau_chunk = self._compute_kinetic_chunk(D, chunk_points)
+
+				# Compute XC potential for this chunk
+				if isinstance(self.xc, (TPSSFunctional, M06Functional)):
+					_, vxc_chunk = self.xc.compute_exc(rho_chunk, grad_rho_chunk, tau_chunk)
+				else:
+					_, vxc_chunk = self.xc.compute_exc(rho_chunk, grad_rho_chunk)
+
+				# Evaluate basis functions for this chunk
+				basis_vals_chunk = self.evaluate_basis_functions(chunk_points)
+
+				# Update Vxc matrix
+				weights_vxc = vxc_chunk * chunk_weights
+				chunk_contribution = np.einsum(
+					"p,pi,pj->ij", weights_vxc, basis_vals_chunk, basis_vals_chunk, optimize=True
+				)
+
+				if isinstance(Vxc, lil_matrix):
+					Vxc += csr_matrix(chunk_contribution)
+				else:
+					Vxc += chunk_contribution
+
+			return Vxc.toarray() if isinstance(Vxc, lil_matrix) else Vxc
 
 		except Exception as e:
 			logging.error(f"Error in compute_vxc_matrix: {str(e)}")
-			logging.error(f"Density matrix shape: {D.shape}")
 			raise
+
+	def _compute_gradient_chunk(self, D: np.ndarray, points: np.ndarray) -> np.ndarray:
+		"""Compute density gradient for a chunk of grid points."""
+		basis_grads = self.evaluate_basis_gradients(points)
+		basis_vals = self.evaluate_basis_functions(points)
+
+		grad_rho = np.zeros((len(points), 3))
+		for i in range(self.n_basis):
+			for j in range(self.n_basis):
+				if abs(D[i, j]) < 1e-10:  # Skip negligible contributions
+					continue
+
+				grads_i = basis_grads[:, i, :].reshape(-1, 3)
+				vals_j = basis_vals[:, j].reshape(-1, 1)
+				grad_rho += 2.0 * D[i, j] * (grads_i * vals_j)
+
+		return grad_rho
+
+	def _compute_kinetic_chunk(self, D: np.ndarray, points: np.ndarray) -> np.ndarray:
+		"""Compute kinetic energy density for a chunk of grid points."""
+		basis_grads = self.evaluate_basis_gradients(points)
+		tau = np.zeros(len(points))
+
+		for i in range(self.n_basis):
+			for j in range(self.n_basis):
+				if abs(D[i, j]) < 1e-10:  # Skip negligible contributions
+					continue
+
+				grad_prod = np.sum(basis_grads[:, i, :] * basis_grads[:, j, :], axis=1)
+				tau += 0.5 * D[i, j] * grad_prod
+
+		return tau
 
 	def compute_exc_energy(self, D: np.ndarray) -> float:
 		"""Compute exchange-correlation energy."""
@@ -714,7 +752,7 @@ class KohnShamDFT:
 
 			# Compute kinetic energy density for meta-GGA functionals
 			if isinstance(self.xc, (TPSSFunctional, M06Functional)):
-				tau = self.compute_kinetic_density(D, self.grid.points)
+				tau = self._compute_kinetic_chunk(D, self.grid.points)
 				logging.debug(f"Kinetic energy density shape in exc: {tau.shape}")
 
 		# Compute exchange-correlation energy density

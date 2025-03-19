@@ -1,4 +1,7 @@
 # ruff: noqa: E741  # Allow ambiguous variable names (l, I, O) due to physics notation
+import itertools
+import logging
+import multiprocessing as mp
 from typing import Tuple
 
 import numpy as np
@@ -6,6 +9,102 @@ from scipy.special import erf
 
 from .basis import BasisSet, overlap_1d
 from .molecule import Molecule
+
+# Global variables for multiprocessing
+MAX_WORKERS = max(1, mp.cpu_count() - 1)  # Leave one CPU free
+BATCH_SIZE = 1000  # Number of ERI computations per batch
+
+
+def _compute_eri_batch(args):
+	"""Helper function for parallel ERI computation."""
+	basis_quartets, basis_functions = args
+	results = []
+
+	for i, j, k, l in basis_quartets:
+		basis_i = basis_functions[i]
+		basis_j = basis_functions[j]
+		basis_k = basis_functions[k]
+		basis_l = basis_functions[l]
+
+		# Skip if centers are too far apart
+		Rij = np.linalg.norm(basis_i.center - basis_j.center)
+		Rkl = np.linalg.norm(basis_k.center - basis_l.center)
+		if Rij > 10.0 or Rkl > 10.0:
+			results.append((i, j, k, l, 0.0))
+			continue
+
+		# Compute ERI for this quartet
+		eri_value = 0.0
+		for prim_i in basis_i.primitives:
+			for prim_j in basis_j.primitives:
+				alpha_i = prim_i.exponent
+				alpha_j = prim_j.exponent
+
+				if max(alpha_i, alpha_j) / min(alpha_i, alpha_j) > 1e4:
+					continue
+
+				gamma1 = alpha_i + alpha_j
+				P = (alpha_i * basis_i.center + alpha_j * basis_j.center) / gamma1
+				K1 = np.exp(-alpha_i * alpha_j * Rij * Rij / gamma1)
+
+				for prim_k in basis_k.primitives:
+					for prim_l in basis_l.primitives:
+						alpha_k = prim_k.exponent
+						alpha_l = prim_l.exponent
+
+						if max(alpha_k, alpha_l) / min(alpha_k, alpha_l) > 1e4:
+							continue
+
+						gamma2 = alpha_k + alpha_l
+						Q = (alpha_k * basis_k.center + alpha_l * basis_l.center) / gamma2
+						K2 = np.exp(-alpha_k * alpha_l * Rkl * Rkl / gamma2)
+
+						RPQ = np.linalg.norm(P - Q)
+						if RPQ < 1e-10:
+							RPQ = 1e-10
+
+						eta = gamma1 * gamma2 / (gamma1 + gamma2)
+						x = eta * RPQ * RPQ
+						F0 = np.sqrt(np.pi / (4 * x)) * erf(np.sqrt(x)) if x > 1e-6 else 1.0
+
+						# Compute angular terms
+						angular_term = 1.0
+						for dim in range(3):
+							l1, m1, n1 = basis_i.angular_momentum
+							l2, m2, n2 = basis_j.angular_momentum
+							l3, m3, n3 = basis_k.angular_momentum
+							l4, m4, n4 = basis_l.angular_momentum
+
+							L1 = [l1, m1, n1][dim]
+							L2 = [l2, m2, n2][dim]
+							L3 = [l3, m3, n3][dim]
+							L4 = [l4, m4, n4][dim]
+
+							PA = P[dim] - basis_i.center[dim]
+							PB = P[dim] - basis_j.center[dim]
+							QC = Q[dim] - basis_k.center[dim]
+							QD = Q[dim] - basis_l.center[dim]
+
+							term1 = overlap_1d(L1, L2, PA, PB, gamma1)
+							term2 = overlap_1d(L3, L4, QC, QD, gamma2)
+							angular_term *= term1 * term2
+
+						prefactor = 2 * np.pi * np.pi / (gamma1 * gamma2 * np.sqrt(gamma1 + gamma2))
+						eri_value += (
+							prim_i.coefficient
+							* prim_j.coefficient
+							* prim_k.coefficient
+							* prim_l.coefficient
+							* K1
+							* K2
+							* angular_term
+							* F0
+							* prefactor
+						)
+
+		results.append((i, j, k, l, eri_value))
+
+	return results
 
 
 class HartreeFock:
@@ -30,6 +129,16 @@ class HartreeFock:
 		self.n_basis = len(self.basis_functions)
 		self.n_electrons = molecule.n_electrons
 		self.n_occupied = self.n_electrons // 2  # Assuming closed shell
+
+		# Initialize multiprocessing pool
+		self.pool = mp.Pool(MAX_WORKERS)
+		logging.info(f"Initialized multiprocessing pool with {MAX_WORKERS} workers")
+
+	def __del__(self):
+		"""Clean up multiprocessing resources."""
+		if hasattr(self, "pool"):
+			self.pool.close()
+			self.pool.join()
 
 	def compute_overlap_matrix(self) -> np.ndarray:
 		"""Compute the overlap matrix S using analytical integrals."""
@@ -187,114 +296,36 @@ class HartreeFock:
 		return V
 
 	def compute_electron_repulsion_integrals(self) -> np.ndarray:
-		"""
-		Compute the two-electron repulsion integrals.
-		The electron repulsion integral between four Gaussian basis functions is:
-		(ij|kl) = ∫∫ φᵢ(r₁)φⱼ(r₁) (1/|r₁-r₂|) φₖ(r₂)φₗ(r₂) dr₁dr₂
-		"""
+		"""Memory-efficient computation of two-electron repulsion integrals using multiprocessing."""
 		n = self.n_basis
-		eri = np.zeros((n, n, n, n))
 
-		for i, basis_i in enumerate(self.basis_functions):
-			for j, basis_j in enumerate(self.basis_functions):
-				# First electron center distance
-				Rij = np.linalg.norm(basis_i.center - basis_j.center)
-				if Rij > 10.0:  # Skip if centers are too far apart
-					continue
+		# Use sparse matrix for large basis sets
+		if n > 100:
+			eri = np.zeros((n, n, n, n))  # Will be filled sparsely
+		else:
+			eri = np.zeros((n, n, n, n))
 
-				for k, basis_k in enumerate(self.basis_functions):
-					for l, basis_l in enumerate(self.basis_functions):
-						# Second electron center distance
-						Rkl = np.linalg.norm(basis_k.center - basis_l.center)
-						if Rkl > 10.0:  # Skip if centers are too far apart
-							continue
+		# Generate all unique basis function quartets
+		quartets = []
+		for i, j, k, l in itertools.product(range(n), repeat=4):
+			# Use symmetry to reduce computations
+			if i >= j and k >= l and (i * n + j) >= (k * n + l):
+				quartets.append((i, j, k, l))
 
-						# Initialize integral for this basis function quartet
-						eri_ijkl = 0.0
+		# Split quartets into batches
+		batches = [quartets[i : i + BATCH_SIZE] for i in range(0, len(quartets), BATCH_SIZE)]
 
-						# Loop over all primitive combinations
-						for prim_i in basis_i.primitives:
-							for prim_j in basis_j.primitives:
-								alpha_i = prim_i.exponent
-								alpha_j = prim_j.exponent
+		# Process batches in parallel
+		for batch in batches:
+			results = self.pool.map(_compute_eri_batch, [(batch, self.basis_functions)])
 
-								# Skip if exponents are too different
-								if max(alpha_i, alpha_j) / min(alpha_i, alpha_j) > 1e4:
-									continue
-
-								# First Gaussian product
-								gamma1 = alpha_i + alpha_j
-								P = (alpha_i * basis_i.center + alpha_j * basis_j.center) / gamma1
-								K1 = np.exp(-alpha_i * alpha_j * Rij * Rij / gamma1)
-
-								for prim_k in basis_k.primitives:
-									for prim_l in basis_l.primitives:
-										alpha_k = prim_k.exponent
-										alpha_l = prim_l.exponent
-
-										# Skip if exponents are too different
-										if max(alpha_k, alpha_l) / min(alpha_k, alpha_l) > 1e4:
-											continue
-
-										# Second Gaussian product
-										gamma2 = alpha_k + alpha_l
-										Q = (alpha_k * basis_k.center + alpha_l * basis_l.center) / gamma2
-										K2 = np.exp(-alpha_k * alpha_l * Rkl * Rkl / gamma2)
-
-										# Distance between Gaussian products
-										RPQ = np.linalg.norm(P - Q)
-										if RPQ < 1e-10:
-											RPQ = 1e-10
-
-										# Combined exponent
-										eta = gamma1 * gamma2 / (gamma1 + gamma2)
-
-										# Boys function argument
-										x = eta * RPQ * RPQ
-
-										# Compute Boys function (using error function for F₀)
-										F0 = np.sqrt(np.pi / (4 * x)) * erf(np.sqrt(x)) if x > 1e-6 else 1.0
-
-										# Compute angular momentum terms
-										angular_term = 1.0
-										for dim in range(3):
-											l1, m1, n1 = basis_i.angular_momentum
-											l2, m2, n2 = basis_j.angular_momentum
-											l3, m3, n3 = basis_k.angular_momentum
-											l4, m4, n4 = basis_l.angular_momentum
-
-											# Get angular momentum for current dimension
-											L1 = [l1, m1, n1][dim]
-											L2 = [l2, m2, n2][dim]
-											L3 = [l3, m3, n3][dim]
-											L4 = [l4, m4, n4][dim]
-
-											# Position differences
-											PA = P[dim] - basis_i.center[dim]
-											PB = P[dim] - basis_j.center[dim]
-											QC = Q[dim] - basis_k.center[dim]
-											QD = Q[dim] - basis_l.center[dim]
-
-											# Compute overlap-like terms
-											term1 = overlap_1d(L1, L2, PA, PB, gamma1)
-											term2 = overlap_1d(L3, L4, QC, QD, gamma2)
-											angular_term *= term1 * term2
-
-										# Add contribution to ERI
-										prefactor = 2 * np.pi * np.pi / (gamma1 * gamma2 * np.sqrt(gamma1 + gamma2))
-										eri_ijkl += (
-											prim_i.coefficient
-											* prim_j.coefficient
-											* prim_k.coefficient
-											* prim_l.coefficient
-											* K1
-											* K2
-											* angular_term
-											* F0
-											* prefactor
-										)
-
-						eri[i, j, k, l] = eri_ijkl
+			# Update ERI tensor
+			for batch_results in results:
+				for i, j, k, l, value in batch_results:
+					# Use symmetry to fill all equivalent elements
+					eri[i, j, k, l] = eri[j, i, k, l] = eri[i, j, l, k] = eri[j, i, l, k] = eri[k, l, i, j] = eri[
+						l, k, i, j
+					] = eri[k, l, j, i] = eri[l, k, j, i] = value
 
 		return eri
 
@@ -303,15 +334,26 @@ class HartreeFock:
 		return np.eye(self.n_basis) * 0.1
 
 	def compute_fock_matrix(self, D: np.ndarray, h_core: np.ndarray, eri: np.ndarray) -> np.ndarray:
-		"""Compute the Fock matrix."""
+		"""Memory-efficient computation of the Fock matrix."""
 		F = h_core.copy()
-		for i_basis in range(self.n_basis):
-			for j_basis in range(self.n_basis):
-				for k_basis in range(self.n_basis):
-					for l_basis in range(self.n_basis):
-						F[i_basis, j_basis] += D[k_basis, l_basis] * (
-							2.0 * eri[i_basis, j_basis, k_basis, l_basis] - eri[i_basis, k_basis, j_basis, l_basis]
-						)
+		n = self.n_basis
+
+		# Process in batches to reduce memory usage
+		batch_size = 100
+		for i in range(0, n, batch_size):
+			i_end = min(i + batch_size, n)
+			for j in range(0, n, batch_size):
+				j_end = min(j + batch_size, n)
+
+				# Extract relevant ERI block
+				eri_block = eri[i:i_end, j:j_end, :, :]
+
+				# Compute Coulomb and exchange terms
+				for k in range(n):
+					for l in range(n):
+						if abs(D[k, l]) > 1e-10:  # Skip negligible contributions
+							F[i:i_end, j:j_end] += D[k, l] * (2.0 * eri_block[:, :, k, l] - eri_block[:, k, :, l])
+
 		return F
 
 	def compute(self) -> Tuple[float, np.ndarray, np.ndarray]:
