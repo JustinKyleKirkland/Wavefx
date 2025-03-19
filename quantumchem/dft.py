@@ -462,6 +462,35 @@ class PW91Functional(DFTFunctional):
 		return ex + ec, vxc
 
 
+def overlap_1d(l1: int, l2: int, PA: float, PB: float, gamma: float) -> float:
+	"""
+	Compute one-dimensional overlap integral between two Gaussian functions.
+
+	Args:
+		l1: Angular momentum quantum number for first function
+		l2: Angular momentum quantum number for second function
+		PA: Distance from center of first function to center of overlap
+		PB: Distance from center of second function to center of overlap
+		gamma: Sum of exponents
+
+	Returns:
+		One-dimensional overlap integral
+	"""
+	if l1 < 0 or l2 < 0:
+		return 0.0
+
+	if l1 == 0 and l2 == 0:
+		return np.sqrt(np.pi / gamma)
+
+	if l1 == 0:
+		return PB * overlap_1d(0, l2 - 1, PA, PB, gamma)
+
+	if l2 == 0:
+		return PA * overlap_1d(l1 - 1, 0, PA, PB, gamma)
+
+	return PA * overlap_1d(l1 - 1, l2, PA, PB, gamma) + (l2 / (2 * gamma)) * overlap_1d(l1, l2 - 2, PA, PB, gamma)
+
+
 class KohnShamDFT:
 	"""Kohn-Sham DFT implementation."""
 
@@ -816,6 +845,328 @@ class KohnShamDFT:
 
 		return tau
 
+	def compute_overlap_matrix_derivative(self, atom_idx: int) -> np.ndarray:
+		"""
+		Compute derivative of overlap matrix with respect to nuclear coordinates.
+
+		Args:
+			atom_idx: Index of atom to compute derivative with respect to
+
+		Returns:
+			Derivative of overlap matrix
+		"""
+		dS = np.zeros((self.n_basis, self.n_basis))
+		for i, basis_i in enumerate(self.basis_functions):
+			for j, basis_j in enumerate(self.basis_functions):
+				# Skip if neither basis function is centered on the atom
+				if basis_i.center_idx != atom_idx and basis_j.center_idx != atom_idx:
+					continue
+
+				# Compute derivative of overlap integral
+				for prim_i in basis_i.primitives:
+					for prim_j in basis_j.primitives:
+						alpha_i = prim_i.exponent
+						alpha_j = prim_j.exponent
+
+						if max(alpha_i, alpha_j) / min(alpha_i, alpha_j) > 1e4:
+							continue
+
+						gamma = alpha_i + alpha_j
+						P = (alpha_i * basis_i.center + alpha_j * basis_j.center) / gamma
+
+						# Compute derivative terms
+						for dim in range(3):
+							l1, m1, n1 = basis_i.angular_momentum
+							l2, m2, n2 = basis_j.angular_momentum
+
+							L1 = [l1, m1, n1][dim]
+							L2 = [l2, m2, n2][dim]
+
+							PA = P[dim] - basis_i.center[dim]
+							PB = P[dim] - basis_j.center[dim]
+
+							# Derivative with respect to atom_idx
+							if basis_i.center_idx == atom_idx:
+								dS[i, j] += (
+									prim_i.coefficient
+									* prim_j.coefficient
+									* (2 * alpha_i * (P[dim] - basis_i.center[dim]) * overlap_1d(L1, L2, PA, PB, gamma))
+								)
+							if basis_j.center_idx == atom_idx:
+								dS[i, j] += (
+									prim_i.coefficient
+									* prim_j.coefficient
+									* (2 * alpha_j * (P[dim] - basis_j.center[dim]) * overlap_1d(L1, L2, PA, PB, gamma))
+								)
+
+		return dS
+
+	def compute_kinetic_matrix_derivative(self, atom_idx: int) -> np.ndarray:
+		"""
+		Compute derivative of kinetic energy matrix with respect to nuclear coordinates.
+
+		Args:
+			atom_idx: Index of atom to compute derivative with respect to
+
+		Returns:
+			Derivative of kinetic energy matrix
+		"""
+		dT = np.zeros((self.n_basis, self.n_basis))
+		for i, basis_i in enumerate(self.basis_functions):
+			for j, basis_j in enumerate(self.basis_functions):
+				# Skip if neither basis function is centered on the atom
+				if basis_i.center_idx != atom_idx and basis_j.center_idx != atom_idx:
+					continue
+
+				# Compute derivative of kinetic energy integral
+				for prim_i in basis_i.primitives:
+					for prim_j in basis_j.primitives:
+						alpha_i = prim_i.exponent
+						alpha_j = prim_j.exponent
+
+						if max(alpha_i, alpha_j) / min(alpha_i, alpha_j) > 1e4:
+							continue
+
+						gamma = alpha_i + alpha_j
+						P = (alpha_i * basis_i.center + alpha_j * basis_j.center) / gamma
+
+						# Compute derivative terms
+						for dim in range(3):
+							l1, m1, n1 = basis_i.angular_momentum
+							l2, m2, n2 = basis_j.angular_momentum
+
+							L1 = [l1, m1, n1][dim]
+							L2 = [l2, m2, n2][dim]
+
+							PA = P[dim] - basis_i.center[dim]
+							PB = P[dim] - basis_j.center[dim]
+
+							# Derivative with respect to atom_idx
+							if basis_i.center_idx == atom_idx:
+								dT[i, j] += (
+									prim_i.coefficient
+									* prim_j.coefficient
+									* (
+										-alpha_i * (2 * L2 + 1) * overlap_1d(L1, L2, PA, PB, gamma)
+										+ 2
+										* alpha_i
+										* alpha_j
+										* (P[dim] - basis_i.center[dim])
+										* overlap_1d(L1, L2 + 2, PA, PB, gamma)
+									)
+								)
+							if basis_j.center_idx == atom_idx:
+								dT[i, j] += (
+									prim_i.coefficient
+									* prim_j.coefficient
+									* (
+										-alpha_j * (2 * L2 + 1) * overlap_1d(L1, L2, PA, PB, gamma)
+										+ 2
+										* alpha_i
+										* alpha_j
+										* (P[dim] - basis_j.center[dim])
+										* overlap_1d(L1, L2 + 2, PA, PB, gamma)
+									)
+								)
+
+		return dT
+
+	def compute_nuclear_attraction_matrix_derivative(self, atom_idx: int) -> np.ndarray:
+		"""
+		Compute derivative of nuclear attraction matrix with respect to nuclear coordinates.
+
+		Args:
+			atom_idx: Index of atom to compute derivative with respect to
+
+		Returns:
+			Derivative of nuclear attraction matrix
+		"""
+		dV = np.zeros((self.n_basis, self.n_basis))
+		for i, basis_i in enumerate(self.basis_functions):
+			for j, basis_j in enumerate(self.basis_functions):
+				# Skip if neither basis function is centered on the atom
+				if basis_i.center_idx != atom_idx and basis_j.center_idx != atom_idx:
+					continue
+
+				# Compute derivative of nuclear attraction integral
+				for prim_i in basis_i.primitives:
+					for prim_j in basis_j.primitives:
+						alpha_i = prim_i.exponent
+						alpha_j = prim_j.exponent
+
+						if max(alpha_i, alpha_j) / min(alpha_i, alpha_j) > 1e4:
+							continue
+
+						gamma = alpha_i + alpha_j
+						P = (alpha_i * basis_i.center + alpha_j * basis_j.center) / gamma
+
+						# Loop over all nuclei
+						for k, Z in enumerate(self.molecule.atomic_numbers):
+							R = self.molecule.coordinates[k]
+							RP = np.linalg.norm(R - P)
+							if RP < 1e-10:
+								RP = 1e-10
+
+							# Compute derivative terms
+							for dim in range(3):
+								l1, m1, n1 = basis_i.angular_momentum
+								l2, m2, n2 = basis_j.angular_momentum
+
+								L1 = [l1, m1, n1][dim]
+								L2 = [l2, m2, n2][dim]
+
+								PA = P[dim] - basis_i.center[dim]
+								PB = P[dim] - basis_j.center[dim]
+
+								# Derivative with respect to atom_idx
+								if basis_i.center_idx == atom_idx:
+									dV[i, j] -= (
+										Z
+										* prim_i.coefficient
+										* prim_j.coefficient
+										* (
+											2
+											* alpha_i
+											* (P[dim] - basis_i.center[dim])
+											* overlap_1d(L1, L2, PA, PB, gamma)
+											/ RP
+										)
+									)
+								if basis_j.center_idx == atom_idx:
+									dV[i, j] -= (
+										Z
+										* prim_i.coefficient
+										* prim_j.coefficient
+										* (
+											2
+											* alpha_j
+											* (P[dim] - basis_j.center[dim])
+											* overlap_1d(L1, L2, PA, PB, gamma)
+											/ RP
+										)
+									)
+								if k == atom_idx:
+									dV[i, j] -= (
+										Z
+										* prim_i.coefficient
+										* prim_j.coefficient
+										* (
+											2
+											* gamma
+											* (P[dim] - R[dim])
+											* overlap_1d(L1, L2, PA, PB, gamma)
+											/ (RP * RP * RP)
+										)
+									)
+
+		return dV
+
+	def compute_exchange_correlation_matrix_derivative(self, atom_idx: int) -> np.ndarray:
+		"""
+		Compute derivative of exchange-correlation matrix with respect to nuclear coordinates.
+
+		Args:
+			atom_idx: Index of atom to compute derivative with respect to
+
+		Returns:
+			Derivative of exchange-correlation matrix
+		"""
+		dVxc = np.zeros((self.n_basis, self.n_basis))
+		for i, basis_i in enumerate(self.basis_functions):
+			for j, basis_j in enumerate(self.basis_functions):
+				# Skip if neither basis function is centered on the atom
+				if basis_i.center_idx != atom_idx and basis_j.center_idx != atom_idx:
+					continue
+
+				# Compute derivative of exchange-correlation integral
+				for prim_i in basis_i.primitives:
+					for prim_j in basis_j.primitives:
+						alpha_i = prim_i.exponent
+						alpha_j = prim_j.exponent
+
+						if max(alpha_i, alpha_j) / min(alpha_i, alpha_j) > 1e4:
+							continue
+
+						gamma = alpha_i + alpha_j
+						P = (alpha_i * basis_i.center + alpha_j * basis_j.center) / gamma
+
+						# Compute derivative terms
+						for dim in range(3):
+							l1, m1, n1 = basis_i.angular_momentum
+							l2, m2, n2 = basis_j.angular_momentum
+
+							L1 = [l1, m1, n1][dim]
+							L2 = [l2, m2, n2][dim]
+
+							PA = P[dim] - basis_i.center[dim]
+							PB = P[dim] - basis_j.center[dim]
+
+							# Derivative with respect to atom_idx
+							if basis_i.center_idx == atom_idx:
+								dVxc[i, j] += (
+									prim_i.coefficient
+									* prim_j.coefficient
+									* (2 * alpha_i * (P[dim] - basis_i.center[dim]) * overlap_1d(L1, L2, PA, PB, gamma))
+								)
+							if basis_j.center_idx == atom_idx:
+								dVxc[i, j] += (
+									prim_i.coefficient
+									* prim_j.coefficient
+									* (2 * alpha_j * (P[dim] - basis_j.center[dim]) * overlap_1d(L1, L2, PA, PB, gamma))
+								)
+
+		return dVxc
+
+	def compute_forces(self) -> np.ndarray:
+		"""
+		Compute forces on nuclei using the Hellmann-Feynman theorem.
+
+		Returns:
+			Forces on nuclei (n_atoms x 3)
+		"""
+		n_atoms = len(self.molecule.atomic_numbers)
+		forces = np.zeros((n_atoms, 3))
+
+		# Compute density matrix
+		P = np.zeros((self.n_basis, self.n_basis))
+		for i in range(self.n_electrons // 2):
+			for j in range(self.n_basis):
+				for k in range(self.n_basis):
+					P[j, k] += 2 * self.C[j, i] * self.C[k, i]
+
+		# Compute forces for each atom
+		for atom_idx in range(n_atoms):
+			# Compute derivative matrices
+			dS = self.compute_overlap_matrix_derivative(atom_idx)
+			dT = self.compute_kinetic_matrix_derivative(atom_idx)
+			dV = self.compute_nuclear_attraction_matrix_derivative(atom_idx)
+			dVxc = self.compute_exchange_correlation_matrix_derivative(atom_idx)
+
+			# Compute force components
+			for dim in range(3):
+				# Kinetic energy contribution
+				forces[atom_idx, dim] += np.sum(P * dT)
+
+				# Nuclear attraction contribution
+				forces[atom_idx, dim] += np.sum(P * dV)
+
+				# Exchange-correlation contribution
+				forces[atom_idx, dim] += np.sum(P * dVxc)
+
+				# Nuclear repulsion contribution
+				for j in range(n_atoms):
+					if j != atom_idx:
+						R = self.molecule.coordinates[atom_idx] - self.molecule.coordinates[j]
+						R_norm = np.linalg.norm(R)
+						forces[atom_idx, dim] += (
+							self.molecule.atomic_numbers[atom_idx]
+							* self.molecule.atomic_numbers[j]
+							* R[dim]
+							/ (R_norm * R_norm * R_norm)
+						)
+
+		return forces
+
 	def compute(self) -> Tuple[float, np.ndarray, np.ndarray]:
 		"""
 		Perform Kohn-Sham DFT calculation.
@@ -896,3 +1247,37 @@ class KohnShamDFT:
 			logging.warning("\nSCF did not converge!")
 
 		return E_tot, eps, C
+
+	def compute_energy(self) -> float:
+		"""
+		Compute total energy of the system.
+
+		Returns:
+			Total energy
+		"""
+		# Compute density matrix
+		P = np.zeros((self.n_basis, self.n_basis))
+		for i in range(self.n_electrons // 2):
+			for j in range(self.n_basis):
+				for k in range(self.n_basis):
+					P[j, k] += 2 * self.C[j, i] * self.C[k, i]
+
+		# Compute energy components
+		E_kinetic = np.sum(P * self.T)
+		E_nuclear = np.sum(P * self.V)
+		E_coulomb = 0.5 * np.sum(P * self.J)
+		E_xc = np.sum(P * self.Vxc)
+
+		# Compute nuclear repulsion energy
+		E_nuclear_repulsion = 0.0
+		n_atoms = len(self.molecule.atomic_numbers)
+		for i in range(n_atoms):
+			for j in range(i + 1, n_atoms):
+				R = self.molecule.coordinates[i] - self.molecule.coordinates[j]
+				R_norm = np.linalg.norm(R)
+				E_nuclear_repulsion += self.molecule.atomic_numbers[i] * self.molecule.atomic_numbers[j] / R_norm
+
+		# Total energy
+		E_total = E_kinetic + E_nuclear + E_coulomb + E_xc + E_nuclear_repulsion
+
+		return E_total
