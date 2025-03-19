@@ -340,3 +340,88 @@ class BasisSet:
 	def available_basis_sets(cls) -> List[str]:
 		"""Return a list of available basis set names."""
 		return list(BASIS_SETS.keys())
+
+
+class BasisFunction:
+	"""A contracted Gaussian basis function."""
+
+	def __init__(self, center: np.ndarray, angular_momentum: Tuple[int, int, int], primitives: List[PrimitiveGaussian]):
+		"""
+		Initialize a basis function.
+
+		Args:
+			center: Center of the basis function
+			angular_momentum: Tuple of (l, m, n) angular momentum components
+			primitives: List of primitive Gaussians
+		"""
+		self.center = np.array(center)
+		self.angular_momentum = angular_momentum
+		self.primitives = primitives
+
+	def evaluate(self, r: np.ndarray) -> float:
+		"""
+		Evaluate the basis function at point r.
+
+		Args:
+			r: Position vector where to evaluate the basis function
+
+		Returns:
+			Value of the basis function at r
+		"""
+		l, m, n = self.angular_momentum
+		value = 0.0
+
+		# Vector from center to evaluation point
+		R = r - self.center
+
+		# Angular part (x-y-z components)
+		xyz = R[0] ** l * R[1] ** m * R[2] ** n
+
+		# Sum over primitives
+		for prim in self.primitives:
+			# Radial part
+			r2 = np.sum(R * R)
+			radial = np.exp(-prim.exponent * r2)
+
+			# Add contribution
+			value += prim.coefficient * xyz * radial
+
+		return value
+
+	def evaluate_gradient(self, r: np.ndarray) -> np.ndarray:
+		"""
+		Evaluate the gradient of the basis function at point r.
+
+		Args:
+			r: Position vector where to evaluate the gradient
+
+		Returns:
+			Gradient vector of the basis function at r
+		"""
+		l, m, n = self.angular_momentum
+		grad = np.zeros(3)
+
+		# Vector from center to evaluation point
+		R = r - self.center
+
+		for prim in self.primitives:
+			# Radial part and its derivative
+			r2 = np.sum(R * R)
+			exp_term = np.exp(-prim.exponent * r2)
+
+			# Handle x component
+			if l > 0:
+				grad[0] += prim.coefficient * l * R[0] ** (l - 1) * R[1] ** m * R[2] ** n * exp_term
+			grad[0] += prim.coefficient * R[0] ** l * R[1] ** m * R[2] ** n * (-2 * prim.exponent * R[0]) * exp_term
+
+			# Handle y component
+			if m > 0:
+				grad[1] += prim.coefficient * R[0] ** l * m * R[1] ** (m - 1) * R[2] ** n * exp_term
+			grad[1] += prim.coefficient * R[0] ** l * R[1] ** m * R[2] ** n * (-2 * prim.exponent * R[1]) * exp_term
+
+			# Handle z component
+			if n > 0:
+				grad[2] += prim.coefficient * R[0] ** l * R[1] ** m * n * R[2] ** (n - 1) * exp_term
+			grad[2] += prim.coefficient * R[0] ** l * R[1] ** m * R[2] ** n * (-2 * prim.exponent * R[2]) * exp_term
+
+		return grad
